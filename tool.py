@@ -11,21 +11,33 @@ import glob
 import shutil
 import webbrowser
 from urllib.parse import quote
+import json
+import winreg
+import psutil
+import pystray
+import threading
+import re
+import time
 
+BACKUP_FILE = "optimizer_backup.json"
+CACHE_DIR = "cache"
+CACHE_FILE = "agents_cache.json"
+CACHE_TTL = 86400  # 1 ngày = 86400 giây
 
-# Biến toàn cục
-destination_folder = ""
-lang_var = None  # khai báo trước
-main_ui_window = None  # window chính
-agent_image_label = None
-loaded_once = False
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-choice_map = {
-    "en_US": "en_US",
-    "ja_JP": "ja_JP",
-    "ko_KR": "ko_KR",
-}
+def is_cache_expired(path, max_age=CACHE_TTL):
+    if not os.path.exists(path):
+        return True
+    return (time.time() - os.path.getmtime(path)) > max_age
 
+def resource_path(relative_path):
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+# ====== Load icon ======
+ICON_PNG = resource_path("logo.png")
+ICON_ICO = resource_path("logo.ico")
 
 # --- Hàm chức năng ---
 def showMatureContent():
@@ -59,40 +71,57 @@ def removeVNGLogo():
     except Exception as e:
         messagebox.showerror("Lỗi", str(e))
 
-
-# def changeLanguage():
-#     try:
-#         choice = lang_var.get()
-#         if choice not in choice_map:
-#             messagebox.showwarning("Cảnh báo", "Vui lòng chọn ngôn ngữ hợp lệ!")
-#             return
-
-#         current_dir = os.path.dirname(os.path.abspath(__file__))
-#         source_folder = os.path.join(current_dir, "setting_files/language", choice_map[choice])
-
-#         for filename in os.listdir(source_folder):
-#             source_file = os.path.join(source_folder, filename)
-#             if os.path.isfile(source_file):
-#                 shutil.copy(source_file, destination_folder)
-
-#         messagebox.showinfo("Hoàn tất", f"Đã chuyển ngôn ngữ sang {choice_map[choice]}!")
-#     except Exception as e:
-#         messagebox.showerror("Lỗi", str(e))
-
-
 # --- Hàm lấy agent ---
 def get_agents_list():
     url = "https://valorant-api.com/v1/agents"
-    response = requests.get(url)
+
+    # Nếu cache tồn tại, chưa hết hạn và không force_refresh
+    if os.path.exists(CACHE_FILE) and not is_cache_expired(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            print("📂 Đọc dữ liệu từ cache...")
+            return json.load(f)
+
+    # Nếu cache hết hạn hoặc force_refresh -> gọi API
+    print("🌐 Gọi API để lấy dữ liệu...")
+    response = requests.get(url, timeout=10)
     if response.status_code != 200:
         raise Exception(f"Lỗi khi lấy dữ liệu: {response.status_code}")
-    
+
     data = response.json()
     agents = [agent for agent in data['data'] if agent['isPlayableCharacter']]
     if not agents:
         raise Exception("Không tìm thấy agent nào")
-    
+
+    # Lưu dữ liệu vào cache
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(agents, f, ensure_ascii=False, indent=2)
+
     return agents
+
+def get_agent_image(url, name, size=(80, 80)):
+    safe_name = safe_filename(name)
+    cache_path = os.path.join(CACHE_DIR, f"{safe_name}.png")
+
+    # Nếu có cache thì load nhanh từ ổ cứng
+    if os.path.exists(cache_path):
+        img = Image.open(cache_path).resize(size, Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+
+    # Nếu chưa có cache thì tải về
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        with open(cache_path, "wb") as f:
+            f.write(response.content)
+        img = Image.open(BytesIO(response.content)).resize(size, Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception as e:
+        print("⚠️ Lỗi tải ảnh:", e)
+        return None
+
+def safe_filename(name: str) -> str:
+    # Thay thế ký tự không hợp lệ bằng "_"
+    return re.sub(r'[\\/:"*?<>|]+', "_", name)
 
 def load_agent_image():
     size = (80, 80)
@@ -116,13 +145,17 @@ def open_agent_page(agent_name):
 
     webbrowser.open(url)
 
-def open_lineup_page(page_number):
+def open_page(page_number):
     url = "https://lineupsvalorant.com/"
 
     if page_number == 1:
         url = "https://lineupsvalorant.com/"
+    elif page_number == 2:
+        url = "https://strats.gg/valorant/lineups/"
+    elif page_number == 3:
+        url = "https://www.vcrdb.net/"
     else:
-        url = "https://strats.gg/valorant/lineups"
+        url = "google.com"
 
     webbrowser.open(url)
 
@@ -131,32 +164,155 @@ def open_tracker_page(player_name):
     url = f"https://tracker.gg/valorant/profile/riot/{encode_name}/overview"
     webbrowser.open(url)
 
-def update_edpi(*args):
-    try:
-        dpi = int(dpi_var.get())
-        sens = float(sens_var.get())
-        edpi = dpi * sens
-        edpi_label.config(text=f"eDPI: {edpi:.2f}")
-        
-        # Recommendation based on eDPI
-        if 200 <= edpi <= 400:
-            recommend_label.config(text="✅ Within the eDPI range pros usually use (200 – 400)")
-        elif edpi < 200:
-            recommend_label.config(text="⬇️ Low eDPI, mouse movement may feel slow")
-        else:
-            recommend_label.config(text="⬆️ High eDPI, mouse movement may feel too fast")
-    except ValueError:
-        edpi_label.config(text="eDPI: ---")
-        recommend_label.config(text="")
+# ===== Hàm dùng chung để đọc/ghi Registry =====
+# ================= BACKUP / RESTORE =================
+def save_backup(data):
+    with open(BACKUP_FILE, "w") as f:
+        json.dump(data, f)
 
+def load_backup():
+    if os.path.exists(BACKUP_FILE):
+        with open(BACKUP_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def get_current_settings():
+    settings = {}
+    try:
+        # Game Bar + Game Mode
+        key_path = r"SOFTWARE\Microsoft\GameBar"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            for name in ["AllowAutoGameMode", "AutoGameModeEnabled", "ShowStartupPanel", "GameDVR_Enabled"]:
+                try:
+                    val, _ = winreg.QueryValueEx(key, name)
+                    settings[name] = val
+                except FileNotFoundError:
+                    pass
+
+        # Game DVR User
+        key_path = r"System\GameConfigStore"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            for name in ["GameDVR_Enabled", "GameDVR_FSEBehaviorMode", "GameDVR_HonorUserFSEBehaviorMode", "GameDVR_EFSEFeatureFlags"]:
+                try:
+                    val, _ = winreg.QueryValueEx(key, name)
+                    settings[name] = val
+                except FileNotFoundError:
+                    pass
+
+        # Captures
+        key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            for name in ["AppCaptureEnabled", "HistoricalCaptureEnabled"]:
+                try:
+                    val, _ = winreg.QueryValueEx(key, name)
+                    settings[name] = val
+                except FileNotFoundError:
+                    pass
+    except Exception as e:
+        print("Backup lỗi:", e)
+
+    return settings
+
+def restore_settings():
+    try:
+        data = load_backup()
+        if not data:
+            # messagebox.showinfo("Thông báo", "Không có dữ liệu backup để khôi phục")
+            return
+
+        # Restore GameBar + GameMode
+        key_path = r"SOFTWARE\Microsoft\GameBar"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            for name in ["AllowAutoGameMode", "AutoGameModeEnabled", "ShowStartupPanel", "GameDVR_Enabled"]:
+                if name in data:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, data[name])
+
+        # Restore Game DVR User
+        key_path = r"System\GameConfigStore"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            for name in ["GameDVR_Enabled", "GameDVR_FSEBehaviorMode", "GameDVR_HonorUserFSEBehaviorMode", "GameDVR_EFSEFeatureFlags"]:
+                if name in data:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, data[name])
+
+        # Restore Captures
+        key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            for name in ["AppCaptureEnabled", "HistoricalCaptureEnabled"]:
+                if name in data:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, data[name])
+
+        # messagebox.showinfo("Thành công", "✅ Khôi phục cài đặt gốc thành công")
+    except Exception as e:
+        messagebox.showerror("Lỗi restore", str(e))
+
+# ================= OPTIMIZATION =================
+def set_registry(key, name, value):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as regkey:
+            winreg.SetValueEx(regkey, name, 0, winreg.REG_DWORD, value)
+    except Exception as e:
+        print("Lỗi registry:", e)
+
+def optimize_settings():
+    try:
+        # Backup trước khi thay đổi
+        if not os.path.exists(BACKUP_FILE):
+            save_backup(get_current_settings())
+
+        # Game Mode OFF
+        set_registry(r"SOFTWARE\Microsoft\GameBar", "AllowAutoGameMode", 0)
+        set_registry(r"SOFTWARE\Microsoft\GameBar", "AutoGameModeEnabled", 0)
+
+        # Game Bar OFF
+        set_registry(r"SOFTWARE\Microsoft\GameBar", "ShowStartupPanel", 0)
+        set_registry(r"SOFTWARE\Microsoft\GameBar", "GameDVR_Enabled", 0)
+
+        # Game DVR User OFF
+        set_registry(r"System\GameConfigStore", "GameDVR_Enabled", 0)
+        set_registry(r"System\GameConfigStore", "GameDVR_FSEBehaviorMode", 2)
+        set_registry(r"System\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode", 1)
+        set_registry(r"System\GameConfigStore", "GameDVR_EFSEFeatureFlags", 0)
+
+        # Captures OFF
+        set_registry(r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", 0)
+        set_registry(r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR", "HistoricalCaptureEnabled", 0)
+
+        # Set Valorant High Priority
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and "VALORANT-Win64-Shipping.exe" in proc.info['name']:
+                psutil.Process(proc.pid).nice(psutil.HIGH_PRIORITY_CLASS)
+                print("✅ Set Valorant High Priority")
+                break
+
+        # Clear Temp
+        temp_dirs = [
+            os.environ.get("TEMP"),
+            r"C:\Windows\Temp"
+        ]
+        for temp in temp_dirs:
+            if temp and os.path.exists(temp):
+                for root, dirs, files in os.walk(temp):
+                    for f in files:
+                        try:
+                            os.remove(os.path.join(root, f))
+                        except:
+                            pass
+                print(f"✅ Đã xoá file rác trong {temp}")
+
+        messagebox.showinfo("Thành công", "Optimize settings complete! (GameMode OFF, GameBar OFF, DVR OFF, High Priority, Clear Temp)")
+
+    except Exception as e:
+        messagebox.showerror("Lỗi", str(e))
 
 # --- Giao diện chính ---
 def main_ui():
-    global lang_var, main_ui_window, agent_image_label, name_label, role_label, dpi_var, sens_var, edpi_label, recommend_label
+    global main_ui_window
     main_ui_window = tk.Tk()
     main_ui_window.title("VALORANT Settings Manager")
     # Full screen window
     main_ui_window.geometry("900x700")
+    main_ui_window.iconbitmap(ICON_ICO)
+    main_ui_window.resizable(False, False)
 
     style = ttk.Style()
     style.theme_use('clam')  # theme dễ tùy chỉnh
@@ -202,6 +358,12 @@ def main_ui():
     btn_remove_logo = tk.Button(tab1, text="Delete VNGLogo", command=removeVNGLogo, **button_style)
     btn_remove_logo.pack(pady=5)
 
+    btn_game_mode = tk.Button(tab1, text="Valorant Optimizer", command=optimize_settings, **button_style)
+    btn_game_mode.pack(pady=5)
+
+    restore_game_mode = tk.Button(tab1, text="Restore Valorant Optimizer", command=restore_settings, **button_style)
+    restore_game_mode.pack(pady=5)
+
     # ---------- Tab 2: Random Agent ----------
     tab2 = tk.Frame(notebook, bg="#1e1e2f")
     notebook.add(tab2, text="Random Agent")
@@ -237,7 +399,7 @@ def main_ui():
 
     # Thêm ảnh vào giao diện
     def load_images_into_tab2():
-        agent_list = load_agent_image()  # [(name, PhotoImage), ...]
+        agent_list = get_agents_list()  # Lấy list agents từ cache/API
 
         # xóa label loading
         loading_label.pack_forget()
@@ -253,21 +415,25 @@ def main_ui():
         cols = max(1, frame_width // item_width)
 
         row, col = 0, 0
-        tab2.agent_widgets = []  # lưu lại widget để random highlight
+        tab2.agent_widgets = []
 
-        for name, photo in agent_list:
+        # Placeholder ảnh (ô vuông trống)
+        placeholder = ImageTk.PhotoImage(Image.new("RGB", (80, 80), "#333333"))
+
+        for item in agent_list:
+            name, url = item['displayName'], item['displayIcon']
+
             frame = tk.Frame(scrollable_frame, bg="#1e1e2f", padx=4, pady=4)
             frame.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
 
-            lbl_img = tk.Label(frame, image=photo, bd=0, highlightthickness=3, highlightbackground="#1e1e2f")
-
-            lbl_img.image = photo
+            lbl_img = tk.Label(frame, image=placeholder, bd=0, highlightthickness=3, highlightbackground="#1e1e2f")
+            lbl_img.image = placeholder
             lbl_img.pack()
 
             lbl_txt = tk.Label(frame, text=name, fg="white", bg="#1e1e2f")
             lbl_txt.pack()
 
-            tab2.agent_widgets.append((frame, lbl_img, lbl_txt))
+            tab2.agent_widgets.append((frame, lbl_img, lbl_txt, url, name))
 
             col += 1
             if col >= cols:
@@ -289,6 +455,20 @@ def main_ui():
 
         tab2.loaded = True  # đánh dấu đã load
 
+        # chạy thread để load ảnh dần
+        def worker():
+            for frame, lbl_img, lbl_txt, url, name in tab2.agent_widgets:
+                photo = get_agent_image(url, name)
+                if photo:
+                    # cập nhật UI trong main thread
+                    canvas.after(0, lambda lbl=lbl_img, p=photo: update_image(lbl, p))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def update_image(label, photo):
+        label.configure(image=photo)
+        label.image = photo
+
     def start_random_animation(widgets):
         if getattr(tab2, "random_running", False):
             return
@@ -303,13 +483,13 @@ def main_ui():
 
         def highlight(step, delay):
             # reset border
-            for frame, lbl_img, lbl_txt in widgets:
+            for frame, lbl_img, lbl_txt, url, name in widgets:
                 lbl_img.config(highlightbackground="#1e1e2f")
 
             if step < steps:
                 # highlight random
                 index = random.randint(0, len(widgets) - 1)
-                f, lbl_img, lbl_txt = widgets[index]
+                frame, lbl_img, lbl_txt, url, name = widgets[index]
                 lbl_img.config(highlightbackground="#ff4655")
 
                 # tăng delay khi gần cuối
@@ -317,7 +497,7 @@ def main_ui():
                 main_ui_window.after(new_delay, lambda: highlight(step+1, new_delay))
             else:
                 # highlight target duy nhất
-                f, lbl_img, lbl_txt = widgets[target_index]
+                frame, lbl_img, lbl_txt, url, name = widgets[target_index]
                 lbl_img.config(highlightbackground="#ff4655")
                 tab2.random_running = False
                 show_random_result(lbl_txt.cget("text"), lbl_img)
@@ -369,11 +549,11 @@ def main_ui():
     tk.Label(tab3, text="Lineup Agent",
              font=("Segoe UI", 18, "bold"), fg="#ff4655", bg="#1e1e2f").pack(pady=10)
 
-    open_lineup_first = tk.Button(tab3, text="lineupsvalorant.com", command = lambda: open_lineup_page(1),
+    open_lineup_first = tk.Button(tab3, text="lineupsvalorant.com", command = lambda: open_page(1),
                              bg="#1e91ff", fg="white", font=("Segoe UI", 11, "bold"), bd=0, relief="flat", width=25, height=2)
     open_lineup_first.pack(pady=5)
 
-    open_lineup_second = tk.Button(tab3, text="strats.gg", command = lambda: open_lineup_page(2),
+    open_lineup_second = tk.Button(tab3, text="strats.gg", command = lambda: open_page(2),
                              bg="#1e91ff", fg="white", font=("Segoe UI", 11, "bold"), bd=0, relief="flat", width=25, height=2)
     open_lineup_second.pack(pady=5)
 
@@ -393,37 +573,16 @@ def main_ui():
     )
     tracker_btn.pack(pady=5)
 
-    tk.Label(tab3, text="eDPI Calculator",
+    tk.Label(tab3, text="Crosshair Collection",
             font=("Segoe UI", 18, "bold"), fg="#ff4655", bg="#1e1e2f").pack(pady=10)
 
-    # Biến liên kết
-    dpi_var = tk.StringVar(value="800")
-    sens_var = tk.StringVar(value="0.5")
-
-    dpi_var.trace_add("write", update_edpi)
-    sens_var.trace_add("write", update_edpi)
-
-    # Label & Entry DPI
-    tk.Label(tab3, text="DPI:", font=("Segoe UI", 11)).pack(pady=5)
-    tk.Entry(tab3, textvariable=dpi_var, font=("Segoe UI", 11)).pack(pady=5)
-
-    # Label & Entry Sensitivity
-    tk.Label(tab3, text="Sensitivity:", font=("Segoe UI", 11)).pack(pady=5)
-    tk.Entry(tab3, textvariable=sens_var, font=("Segoe UI", 11)).pack(pady=5)
-
-    # Label hiển thị kết quả eDPI
-    edpi_label = tk.Label(tab3, text="eDPI: ---", font=("Segoe UI", 12, "bold"), fg="#1e91ff")
-    edpi_label.pack(pady=10)
-
-    # Label gợi ý
-    recommend_label = tk.Label(tab3, text="", font=("Segoe UI", 10), fg="gray")
-    recommend_label.pack()
-
-    # Gọi update lần đầu
-    update_edpi()
+    open_crosshair_list = tk.Button(tab3, text="vcrdb.net", command = lambda: open_page(3),
+                             bg="#1e91ff", fg="white", font=("Segoe UI", 11, "bold"), bd=0, relief="flat", width=25, height=2)
+    open_crosshair_list.pack(pady=5)
 
     # ---------- Tab 4: Crosshair Sample ----------
-
+    tab4 = tk.Frame(notebook, bg="#1e1e2f")
+    notebook.add(tab4, text="ASCII Tool")
 
     # ---------- Tab 5: Zalopay VP Calculator ----------
 
@@ -434,7 +593,7 @@ def main_ui():
     def on_leave(e):
         e.widget['bg'] = "#ff4655" if e.widget['bg'] in ["#ff6b7d","#ff4655"] else "#1e91ff"
 
-    for btn in [btn_mature, btn_remove_logo, open_lineup_first, open_lineup_second, tracker_btn]:
+    for btn in [btn_mature, btn_remove_logo, open_lineup_first, open_lineup_second, open_crosshair_list, tracker_btn, btn_game_mode, restore_game_mode]:
         btn.bind("<Enter>", on_enter)
         btn.bind("<Leave>", on_leave)
 
@@ -445,8 +604,37 @@ def main_ui():
             # giữ cho UI render "Loading..." trước khi load ảnh
             main_ui_window.after(100, load_images_into_tab2)
 
+    # ====== Hàm thoát app ======
+    def on_quit(icon, item):
+        restore_settings()
+        icon.stop()
+        main_ui_window.quit()
+
+
+    # ====== Hàm hiện cửa sổ lại ======
+    def show_window(icon, item):
+        icon.stop()           # tắt tray trước
+        main_ui_window.after(0, main_ui_window.deiconify)  # show lại tkinter window
+
+    # ====== Hàm chạy system tray ======
+    def run_tray():
+        menu = pystray.Menu(
+            pystray.MenuItem("Open", show_window),
+            pystray.MenuItem("Quit ", on_quit)
+        )
+        tray_icon = Image.open(ICON_PNG)  # ← Load thành object Image
+        icon = pystray.Icon("app", tray_icon, "Valorant Tool", menu)
+        icon.run()
+
+    # ====== Khi ẩn cửa sổ ======
+    def hide_window():
+        main_ui_window.withdraw()   # ẩn Tkinter window
+        threading.Thread(target=run_tray, daemon=True).start()
+
     notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
 
+    # Khi tắt cửa sổ → auto restore
+    main_ui_window.protocol("WM_DELETE_WINDOW", hide_window)
     main_ui_window.mainloop()
 
 # --- Giao diện 1: Nhập folder ---
@@ -473,6 +661,7 @@ folder_window.title("Chọn Destination Folder")
 folder_window.geometry("500x250")  # tăng chiều cao
 folder_window.resizable(False, False)
 folder_window.configure(bg="#1e1e2f")
+folder_window.iconbitmap(ICON_ICO)
 
 folder_var = tk.StringVar(value=r"D:\Riot Games\VALORANT\live\ShooterGame\Content\Paks")  # giá trị mặc định
 
