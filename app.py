@@ -31,8 +31,13 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-ICON_PNG = resource_path("logo.png")
-ICON_ICO = resource_path("logo.ico")
+ICON_PNG = resource_path("setting_files/logo.png")
+ICON_ICO = resource_path("setting_files/logo.ico")
+SPIKE_DEFUSE_SOUND = resource_path("setting_files/audio/defuse_sound.mp3")
+SPIKE_ACTIVE_SOUND = resource_path("setting_files/audio/spike_sound.mp3")
+
+# --- Global flag to show tray message only once ---
+tray_message_shown = False
 
 # ========= UI =========
 def run_tray(root):
@@ -52,6 +57,13 @@ def run_tray(root):
 
 def hide_window(root):
     root.withdraw()
+    if not tray_message_shown:
+        messagebox.showinfo(
+            "Valorant Tool",
+            "The application is still running in the system tray.\nRight-click the icon to quit."
+        )
+        tray_message_shown = True
+
     threading.Thread(target=run_tray,args=(root,),daemon=True).start()
 
 class SettingManager:
@@ -107,8 +119,7 @@ class SettingManager:
 
     def showMatureContent(self):
         try:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            source_folder = os.path.join(current_dir, "setting_files/mature_content")
+            source_folder = resource_path("setting_files/mature_content")
 
             for filename in os.listdir(source_folder):
                 source_file = os.path.join(source_folder, filename)
@@ -440,10 +451,14 @@ class SpikeSimulator:
         self.time_left = SPIKE_TIMER
         self.running = False
         self.timer_id = None
-        self.show_timer = True
+        self.show_timer = True  # ✅ mặc định hiển thị đúng với nút
+        self.start_time = None
 
-        # init pygame mixer cho âm thanh
-        pygame.mixer.init()
+        # init pygame mixer cho âm thanh (bọc try/except)
+        try:
+            pygame.mixer.init()
+        except pygame.error as e:
+            print("⚠️ Pygame audio init failed:", e)
 
         # UI
         self.frame = tk.LabelFrame(parent, text="💣 Spike Simulator", font=("Arial", 12, "bold"), fg="white", bg="#0f1923")
@@ -455,24 +470,45 @@ class SpikeSimulator:
         btn_frame = tk.Frame(self.frame, bg="#0f1923")
         btn_frame.pack(pady=5)
 
-        self.plant_btn = tk.Button(btn_frame, text="🔴 Plant", font=("Arial", 14), bg="#ff4655", fg="white", command=self.plant_spike)
+        self.plant_btn = tk.Button(btn_frame, text="🔴 Plant", font=("Arial", 14), bg="#ff4655", fg="white", command=self.plant_spike, cursor="hand2")
         self.plant_btn.grid(row=0, column=0, padx=10)
 
-        self.defuse_btn = tk.Button(btn_frame, text="🟢 Defuse", font=("Arial", 14), bg="#00ffae", fg="black", state="disabled", command=self.defuse_spike)
+        self.defuse_btn = tk.Button(btn_frame, text="🟢 Defuse", font=("Arial", 14), bg="#00ffae", fg="black", state="disabled", command=self.defuse_spike, cursor="hand2")
         self.defuse_btn.grid(row=0, column=1, padx=10)
 
-        self.reset_btn = tk.Button(btn_frame, text="🔄 Reset", font=("Arial", 14), bg="#ffaa00", fg="black", state="disabled", command=self.reset)
+        self.reset_btn = tk.Button(btn_frame, text="🔄 Reset", font=("Arial", 14), bg="#ffaa00", fg="black", state="disabled", command=self.reset, cursor="hand2")
         self.reset_btn.grid(row=0, column=2, padx=10)
 
-        self.toggle_btn = tk.Button(self.frame, text="👁️ Hide Timer", font=("Arial", 12), bg="#1f51ff", fg="white", command=self.toggle_timer)
+        self.toggle_btn = tk.Button(self.frame, text="👁️ Hide Timer", font=("Arial", 12), bg="#1f51ff", fg="white", command=self.toggle_timer, cursor="hand2")
         self.toggle_btn.pack(pady=5)
 
         self.result_label = tk.Label(self.frame, text="", font=("Arial", 14), fg="white", bg="#0f1923")
         self.result_label.pack(pady=10)
 
+        notes_frame = tk.LabelFrame(parent, text="📘 Notes", font=("Arial", 12, "bold"), fg="white", bg="#0f1923")
+        notes_frame.pack(fill="x", pady=10, padx=10)
+
+        notes_text = (
+            "💣 Spike explodes after 45 seconds once planted.\n"
+            "🟢 Full defuse time: 7 seconds.\n"
+            "🟡 Half defuse (hold 3.5s): You can resume defusing from halfway if interrupted.\n"
+            "⚠️ Always try to get a half first, then finish depending on the situation.\n"
+            "💭 If little time remains, consider if 7s defuse + travel time is realistic.\n"
+            "💼 If not, save your weapon and armor for the next round."
+        )
+
+        tk.Label(notes_frame, text=notes_text, font=("Arial", 11), justify="left", anchor="w", fg="#dddddd", bg="#0f1923", wraplength=500).pack(padx=10, pady=5, fill="x")
+
     def play_spike_audio(self):
         try:
-            pygame.mixer.music.load("spike_planted.mp3")
+            pygame.mixer.music.load(SPIKE_ACTIVE_SOUND)
+            pygame.mixer.music.play()
+        except Exception as e:
+            print("⚠️ Audio error:", e)
+
+    def play_defuse_audio(self):
+        try:
+            pygame.mixer.music.load(SPIKE_DEFUSE_SOUND)
             pygame.mixer.music.play()
         except Exception as e:
             print("⚠️ Audio error:", e)
@@ -481,50 +517,69 @@ class SpikeSimulator:
         pygame.mixer.music.stop()
 
     def update_timer(self):
-        if self.time_left >= 0 and self.running:
-            if self.show_timer:
-                self.timer_label.config(text=f"⏳ {self.time_left:.1f}s")
-            else:
-                self.timer_label.config(text="⏳ ???")
-            self.time_left -= 0.1
+        if not self.running:
+            return
+
+        elapsed = time.time() - self.start_time
+        self.time_left = SPIKE_TIMER - elapsed
+
+        if self.time_left >= 0:
+            text = f"⏳ {self.time_left:.1f}s" if self.show_timer else "⏳ ???"
+            self.timer_label.config(text=text)
             self.timer_id = self.parent.after(100, self.update_timer)
-        elif self.time_left < 0:
+        else:
+            # ✅ Dừng khi nổ
             self.running = False
             self.defuse_btn.config(state="disabled")
             self.reset_btn.config(state="normal")
+            self.timer_label.config(text="💥 Spike exploded!")
             messagebox.showinfo("Result", "💥 Spike exploded!")
 
     def plant_spike(self):
         if self.timer_id:
             self.parent.after_cancel(self.timer_id)
+
+        self.play_spike_audio()
+        self.start_time = time.time()
         self.time_left = SPIKE_TIMER
         self.running = True
         self.defuse_btn.config(state="normal")
         self.reset_btn.config(state="disabled")
         self.result_label.config(text="")
         self.update_timer()
-        self.play_spike_audio()
 
     def defuse_spike(self):
         if not self.running:
             return
-        if self.time_left >= DEFUSE_TIME:
+
+        elapsed = time.time() - self.start_time
+        remaining = SPIKE_TIMER - elapsed
+
+        # ✅ Hiển thị thời gian còn lại trước khi nổ
+        self.result_label.config(text=f"🕒 Remaining time before explosion: {remaining:.1f}s")
+
+        self.stop_audio()
+        self.play_defuse_audio()
+
+        if remaining > DEFUSE_TIME:
             self.running = False
             if self.timer_id:
                 self.parent.after_cancel(self.timer_id)
             self.defuse_btn.config(state="disabled")
             self.reset_btn.config(state="normal")
-            self.result_label.config(text="✅ Defuse successful!")
+            self.result_label.config(text=f"✅ Defuse successful! ({remaining:.1f}s left)")
         else:
-            self.result_label.config(text="❌ Too late, Spike exploded!")
-        self.stop_audio()
+            self.running = False
+            if self.timer_id:
+                self.parent.after_cancel(self.timer_id)
+            self.defuse_btn.config(state="disabled")
+            self.reset_btn.config(state="normal")
+            self.result_label.config(text=f"❌ Too late! Spike exploded")
+
 
     def toggle_timer(self):
         self.show_timer = not self.show_timer
-        if self.show_timer:
-            self.toggle_btn.config(text="👁️ Hide Timer")
-        else:
-            self.toggle_btn.config(text="👁️ Show Timer")
+        self.toggle_btn.config(text="👁️ Hide Timer" if self.show_timer else "👁️ Show Timer")
 
     def reset(self):
         if self.timer_id:
@@ -536,7 +591,6 @@ class SpikeSimulator:
         self.defuse_btn.config(state="disabled")
         self.reset_btn.config(state="disabled")
         self.stop_audio()
-
 
 # ========= Entry UI =========
 def open_main_ui(root, folder):
